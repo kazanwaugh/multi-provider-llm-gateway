@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-Provider LLM Gateway</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f3f6fa; color: #182b42; font: 16px system-ui; }
+    main { max-width: 920px; margin: auto; padding: 24px; }
+    h1 { margin-bottom: 8px; }
+    form, section, aside {
+      background: white; border: 1px solid #d7e0ea; border-radius: 12px; padding: 16px;
+    }
+    label { display: block; margin: 8px 0; font-weight: 600; }
+    select, input, textarea, button { font: inherit; padding: 8px; }
+    textarea { display: block; width: 100%; min-height: 100px; margin-top: 6px; }
+    button { background: #18567d; color: white; border: 0; border-radius: 6px; }
+    button:disabled { opacity: 0.6; }
+    .results { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-top: 16px; }
+    #answer { white-space: pre-wrap; overflow-wrap: anywhere; }
+    dl { display: grid; grid-template-columns: 1fr auto; gap: 10px; }
+    dd { margin: 0; font-weight: 600; }
+    @media (max-width: 640px) { .results { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Multi-Provider LLM Gateway</h1>
+  <form id="request">
+    <label>Provider <select id="provider"></select></label>
+    <label>Model <select id="model"></select></label>
+    <label>Temperature
+      <input id="temperature" type="number" min="0" max="1" step="0.1" value="0.7" required>
+    </label>
+    <label>Prompt
+      <textarea id="prompt" maxlength="8000" required placeholder="Enter a prompt"></textarea>
+    </label>
+    <button id="send" type="submit" disabled>Send prompt</button>
+  </form>
+  <p id="status" role="status">Loading models…</p>
+  <div class="results">
+    <section aria-label="Response">
+      <h2>Response</h2>
+      <div id="answer"></div>
+    </section>
+    <aside>
+      <h2>Telemetry</h2>
+      <p id="metric-status">Waiting for a response</p>
+      <dl>
+        <dt>First token</dt><dd id="ttft">—</dd>
+        <dt>Generation speed</dt><dd id="speed">—</dd>
+        <dt>Prompt tokens</dt><dd id="input-count">—</dd>
+        <dt>Completion tokens</dt><dd id="output-count">—</dd>
+        <dt>Estimated cost</dt><dd id="cost">—</dd>
+      </dl>
+    </aside>
+  </div>
+</main>
+<script>
+  const el = id => document.getElementById(id);
+  const metrics = ["ttft", "speed", "input-count", "output-count", "cost"];
+  const controls = ["provider", "model", "temperature", "prompt", "send"];
+  let models = [];
+
+  function selectModels() {
+    el("model").replaceChildren(...models
+      .filter(item => item.provider === el("provider").value)
+      .map(item => new Option(item.model, item.model)));
+  }
+
+  function showMetrics(t, final) {
+    el("metric-status").textContent = final
+      ? "Final provider token counts"
+      : "Live estimates · updated during streaming";
+    el("ttft").textContent = t.ttft_ms == null ? "—" : `${Math.round(t.ttft_ms)} ms`;
+    el("speed").textContent = t.tokens_per_second == null
+      ? "—" : `${t.tokens_per_second.toFixed(1)} tokens/s`;
+    el("input-count").textContent = t.prompt_tokens ?? "—";
+    el("output-count").textContent = t.completion_tokens ?? "—";
+    el("cost").textContent = t.total_cost_usd == null
+      ? "—" : "$" + Number(t.total_cost_usd).toFixed(6);
+  }
+
+  async function loadModels() {
+    try {
+      const response = await fetch("/models");
+      if (!response.ok) throw new Error();
+      models = await response.json();
+      const names = [...new Set(models.map(item => item.provider))];
+      el("provider").replaceChildren(...names.map(name => new Option(name, name)));
+      selectModels();
+      el("send").disabled = false;
+      el("status").textContent = "Ready";
+    } catch {
+      el("status").textContent = "Could not load the model list.";
+    }
+  }
+
+  el("provider").addEventListener("change", selectModels);
+  el("request").addEventListener("submit", async event => {
+    event.preventDefault();
+    const body = {
+      model: el("model").value,
+      prompt: el("prompt").value,
+      temperature: Number(el("temperature").value),
+    };
+    controls.forEach(id => el(id).disabled = true);
+    metrics.forEach(id => el(id).textContent = "—");
+    el("answer").textContent = "";
+    el("status").textContent = "Waiting for the provider…";
+    el("metric-status").textContent = "Waiting for a response";
+
+    let complete = false;
+    try {
+      const response = await fetch("/generate", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      if (!response.ok || !response.body) {
+        throw new Error("Check your prompt and try again.");
+      }
+
+      let buffer = "";
+      for await (const part of response.body.pipeThrough(new TextDecoderStream())) {
+        buffer += part;
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          if (!frame.startsWith("data: ")) continue;
+
+          const chunk = JSON.parse(frame.slice(6));
+          if (chunk.error) throw new Error(chunk.error);
+          if (chunk.delta_text) {
+            el("answer").append(document.createTextNode(chunk.delta_text));
+            el("status").textContent = "Streaming…";
+          }
+          if (chunk.telemetry) showMetrics(chunk.telemetry, chunk.is_final);
+          if (chunk.is_final) {
+            complete = true;
+            el("status").textContent = "Complete";
+          }
+        }
+      }
+      if (!complete) throw new Error("The stream ended before final telemetry arrived.");
+    } catch (error) {
+      el("status").textContent = error.message || "The request failed.";
+    } finally {
+      controls.forEach(id => el(id).disabled = false);
+    }
+  });
+
+  loadModels();
+</script>
+</body>
+</html>
